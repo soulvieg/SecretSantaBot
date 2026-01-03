@@ -1,9 +1,24 @@
+import os
+import discord
+import logging
+from dotenv import load_dotenv
 from bot import BotClient
 
-def main():
-    print("Hello from secret-santa-bot!")
-    client = BotClient()
-    client.run("")
+print("Hello from secret-santa-bot!")
 
-if __name__ == "__main__":
-    main()
+
+# Setup the logger for debugging
+logger = logging.getLogger("discord")
+logger.setLevel(logging.DEBUG)
+hand = logging.FileHandler(filename="bot.log", encoding="utf-8", mode="w")
+hand.setFormatter(logging.Formatter("%(asctime)s:%(levelname)s:%(name)s: %(message)s"))
+logger.addHandler(hand)
+
+load_dotenv()
+token = os.getenv("DISCORD_TOKEN")
+
+if token is None:
+    raise ValueError("ERROR: DISCORD_TOKEN not found in .env file!")
+
+client = BotClient()
+client.run(token)

@@ -8,4 +8,6 @@
 - Giving updates on where and when a package will arrive
 - Each participant can list up to 5 locations (with priority) of where to send the gift and at what name
 
+From ClientUser we can get the id and put it in the db
+
 ## Usage
