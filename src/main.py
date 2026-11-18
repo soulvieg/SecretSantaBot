@@ -1,14 +1,13 @@
-import os
-import discord
 import logging
 from logging.handlers import RotatingFileHandler
-from dotenv import load_dotenv
 from bot import BotClient
 
+import config
 
-def set_logging(lvl: srt = "INFO") -> None:
+
+def set_logging(level: str = "INFO") -> None:
     logging.basicConfig(
-        lvl = lvl.upper(),
+        level = level.upper(),
         format = "%(asctime)s:%(levelname)s:%(name)s: %(message)s",
         handlers = [
             logging.StreamHandler(),
@@ -20,24 +19,16 @@ def set_logging(lvl: srt = "INFO") -> None:
 
 
 def main() -> None:
+    settings = config.get_settings()
     #Setup the logger for debugging
-    set_logging()
+    set_logging(settings.log_lvl)
     logger = logging.getLogger(__name__)
-    logger.info("event %s created by %s", event.id, user.id)
+#   logger.info("event %s created by %s", event.id, user.id)
 
-    bot = BotClient()
-    bot.run()
+    bot = BotClient(settings)
+    bot.run(settings.discord_token)
 
 
 if __name__ == "__main__":
-    print("Hello from secret-santa-bot!")
+    print("Hello, may your secret santa treats you well!")
     main()
-
-load_dotenv()
-token = os.getenv("DISCORD_TOKEN")
-
-if token is None:
-    raise ValueError("ERROR: DISCORD_TOKEN not found in .env file!")
-
-client = BotClient()
-client.run(token)
