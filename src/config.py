@@ -18,8 +18,8 @@ def get_settings() -> Settings:
         raise RuntimeError("Discord token is missing in .env")
     return Settings(
         discord_token = token,
-        db_url = os.getenv("DATABASE_URL","sqlite:///secretsanta.db"),
-        encryption_key = os.getenv("ENCRYPTION_KEY", ""),
+        db_url = os.getenv("DATABASE_URL") or "sqlite:///secretsanta.db",
+        encryption_key = os.getenv("ENCRYPTION_KEY") or "",
         dev = int(os.environ["DEV_ID"]) if os.getenv("DEV_ID") else None,
         log_lvl = os.getenv("LOG_LEVEL", "INFO"),
     )
