@@ -30,8 +30,10 @@ class Circle(Base):
     id: Mapped[int] = mapped_column(sa.Integer, primary_key=True)
     name: Mapped[str] = mapped_column(sa.String(128), nullable=False)
     owner_id: Mapped[int] = mapped_column(sa.Integer, sa.ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
-    discord_server_id: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    discord_server_id: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)
+    announce_channel_id: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
     status: Mapped[str] = mapped_column(sa.String(32), nullable=False, server_default="draft")
+    card_msg_id: Mapped[int | None] = mapped_column(sa.BigInteger, unique=True, nullable=True)
     budget: Mapped[int | None] = mapped_column(sa.Integer, nullable=True) # budget and prices are in cents
     currency: Mapped[str] = mapped_column(sa.String(4), nullable=False, server_default="EUR")
     signup_deadline: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)

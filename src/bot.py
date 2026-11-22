@@ -1,6 +1,8 @@
 import discord
 from discord.ext import commands
 from config import Settings
+from db.engine import engine
+from db.models import Base
 
 class BotClient(commands.Bot):
     def __init__(self, settings: Settings, **kwargs):
@@ -10,7 +12,8 @@ class BotClient(commands.Bot):
 
 
     async def setup_hook(self) -> None:
-        await self.load_extension("cogs.general")
+        Base.metadata.create_all(engine)
+        await self.load_extension("cogs.santa")
 
         # Setup for dev testing server
         if self.settings.dev:
