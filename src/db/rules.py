@@ -4,7 +4,9 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from db.models import Circle, Participant, User
+from crypto import decrypt_payload, encrypt_payload
+from db.models import Circle, ContactInfo, Exclusion, Participant, User, WishlistItem
+
 
 class CircleError(Exception):
     """Errors messages to show from UI to user"""
@@ -27,6 +29,9 @@ class NotJoined(CircleError):
 class NotOwner(CircleError):
     pass
 
+class OwnerCannotLeave(CircleError):
+    pass
+
 def utc_to_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -40,10 +45,12 @@ def get_user(session: Session, discord_id: str) -> User:
             session.add(user)
     except IntegrityError:
         user = session.scalar(sa.select(User).where(User.discord_id == discord_id))
+    if user is None:
+        raise RuntimeError(f"Could not read back user {discord_id}")
     return user
 
 
-def create_circle(session: Session, *, name: str, owner_id:str, discord_server_id:str, budget: int | None = None, signup_deadline: datetime | None = None, exchange_date: datetime | None = None, avoid_repeat: bool = False) -> Circle:
+def create_circle(session: Session, *, name: str, owner_id:str, discord_server_id: int, budget: int | None = None, signup_deadline: datetime | None = None, exchange_date: datetime | None = None, avoid_repeat: bool = False) -> Circle:
     owner = get_user(session, owner_id)
     circle = Circle(
         name = name,
@@ -55,10 +62,12 @@ def create_circle(session: Session, *, name: str, owner_id:str, discord_server_i
         exchange_date = exchange_date,
         avoid_repeat = avoid_repeat
     )
+    session.add(circle)
     try:
         session.flush()
     except IntegrityError as exc:
         raise GroupNameTaken(name) from exc
+    join_circle(session, circle, owner_id)
     return circle
 
 
@@ -80,7 +89,7 @@ def find_circle(session: Session, server_id: int , name: str | None = None, chan
         query = query.where(Circle.name == name)
     elif channel_id:
         query = query.where(Circle.announce_channel_id == channel_id)
-    return session.scalar(query.order_by(Circle.created_at.desc().limit(1)))
+    return session.scalar(query.order_by(Circle.created_at.desc()).limit(1))
 
 def active_count(session: Session, circle_id: int) -> int:
     query = sa.select(sa.func.count()).select_from(Participant).where(Participant.circle_id == circle_id, Participant.withdrawn_at.is_(None))
@@ -108,7 +117,11 @@ def leave_circle(session: Session, circle: Circle, discord_id: str) -> None:
         raise GroupNotOpen(circle.name)
     user = session.scalar(sa.select(User).where(User.discord_id == discord_id))
     participant = None
+
     if user is not None:
+        if user.id == circle.owner_id:
+            raise OwnerCannotLeave(circle.name)
+
         participant = session.scalar(sa.select(Participant).where(Participant.circle_id == circle.id, Participant.user_id == user.id))
     if participant is None or participant.withdrawn_at is not None:
         raise NotJoined(circle.name)
@@ -135,7 +148,110 @@ def role_of(session: Session, circle: Circle, discord_id: str) -> str:
         return "not signup to the event"
     if user.id == circle.owner_id:
         return "organizer"
-    participant = session.scalar(sa.select(Participant).where(Participant.user_id == user.id))
+    participant = session.scalar(sa.select(Participant).where(Participant.user_id == user.id, Participant.circle_id == circle.id))
     if participant is None or participant.withdrawn_at is not None:
         return "not signup to the event"
     return "participant"
+
+
+def set_panel_message(session: Session, participant: Participant, msg_id: int) -> None:
+    participant.panel_msg_id = msg_id
+    session.flush()
+
+
+def participant_from_panel(session: Session, msg_id: int) -> Participant | None:
+    return session.scalar(sa.select(Participant).where(Participant.panel_msg_id == msg_id))
+
+
+def set_ready(session: Session, participant: Participant, ready: bool = True) -> None:
+    participant.ready = ready
+    session.flush()
+
+
+def all_ready(session: Session, circle_id: int) -> bool:
+    active = sa.select(sa.func.count()).select_from(Participant).where(
+        Participant.circle_id == circle_id, Participant.withdrawn_at.is_(None)
+    )
+    pending = active.where(Participant.ready.is_(False))
+    return (session.scalar(active) or 0) >= 3 and (session.scalar(pending) or 0) == 0
+
+
+def try_mark_drawn(session: Session, circle_id: int) -> bool:
+    statement = (
+        sa.update(Circle)
+        .where(Circle.id == circle_id, Circle.status == "collecting")
+        .values(status="drawn", current_round=Circle.current_round + 1)
+        .returning(Circle.id)
+    )
+    return session.execute(statement).first() is not None
+
+
+def save_contact(session: Session, participant: Participant, payload: dict) -> None:
+    token = encrypt_payload(payload)
+    row = session.scalar(sa.select(ContactInfo).where(ContactInfo.participant_id == participant.id))
+    if row is None:
+        session.add(ContactInfo(participant_id=participant.id, payload=token))
+    else:
+        row.payload = token
+    session.flush()
+
+
+def load_contact(session: Session, participant: Participant) -> dict | None:
+    row = session.scalar(sa.select(ContactInfo).where(ContactInfo.participant_id == participant.id))
+    if row is None:
+        return None
+    return decrypt_payload(row.payload)
+
+
+def wishlist_count(session: Session, participant_id: int) -> int:
+    query = sa.select(sa.func.count()).select_from(WishlistItem).where(WishlistItem.participant_id == participant_id)
+    return session.scalar(query) or 0
+
+
+def add_wishlist_item(session: Session, participant: Participant, *, title: str, url: str | None = None, price: int | None = None, note: str | None = None,) -> WishlistItem:
+    item = WishlistItem(
+        participant_id=participant.id,
+        title=title,
+        url=url,
+        price=price,
+        note=note,
+        position=wishlist_count(session, participant.id),
+    )
+    session.add(item)
+    session.flush()
+    return item
+
+
+def exclusion_ids(session: Session, participant: Participant) -> list[int]:
+    query = (
+        sa.select(Exclusion.excluded_participant_id)
+        .where(Exclusion.giver_participant_id == participant.id)
+        .order_by(Exclusion.id)
+    )
+    return list(session.scalars(query))
+
+
+def replace_exclusions(session: Session, circle: Circle, giver: Participant, excluded_ids: list[int]) -> None:
+    session.execute(sa.delete(Exclusion).where(Exclusion.giver_participant_id == giver.id))
+    allowed = set(
+        session.scalars(
+            sa.select(Participant.id).where(
+                Participant.circle_id == circle.id,
+                Participant.withdrawn_at.is_(None),
+                Participant.id != giver.id,
+            )
+        )
+    )
+    seen: set[int] = set()
+    for pid in excluded_ids:
+        if pid not in allowed or pid in seen:
+            continue
+        seen.add(pid)
+        session.add(
+            Exclusion(
+                circle_id=circle.id,
+                giver_participant_id=giver.id,
+                excluded_participant_id=pid,
+            )
+        )
+    session.flush()

@@ -2,30 +2,14 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from db.engine import build_engine
 from db.models import (
     Assignment,
-    Base,
     Circle,
     Exclusion,
     Participant,
     Shipment,
     User,
 )
-
-
-@pytest.fixture
-def engine(tmp_path):
-    engine = build_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    Base.metadata.create_all(engine)
-    yield engine
-    engine.dispose()
-
-
-@pytest.fixture
-def session(engine):
-    with Session(engine, expire_on_commit=False) as session:
-        yield session
 
 
 def make_user(session: Session, discord_id: str) -> User:

@@ -60,6 +60,7 @@ class Participant(Base):
     joined_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now())
     withdrawn_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
     ready: Mapped[bool] = mapped_column(nullable=False, server_default=sa.false())
+    panel_msg_id: Mapped[int | None] = mapped_column(sa.BigInteger, unique=True, nullable=True)
 
     __table_args__ = (
         sa.UniqueConstraint("circle_id", "user_id", name="unique_user_circle"),
