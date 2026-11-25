@@ -102,8 +102,8 @@ def test_contact_roundtrip(session, make_circle, make_participant):
     participant = make_participant(make_circle())
     payload = {
         "address": "Via Roma 1",
-        "city": "Torino",
-        "zip": "10121",
+        "city": "Milan",
+        "zip": "10221",
         "phone": "+39 000 000 0000",
         "digital": {"platform": "steam", "id": "12345"},
     }
@@ -121,11 +121,11 @@ def test_save_contact_upserts_single_row(session, make_circle, make_participant)
     participant = make_participant(make_circle())
 
     rules.save_contact(session, participant, {"address": "Via Roma 1"})
-    rules.save_contact(session, participant, {"address": "Via Po 2"})
+    rules.save_contact(session, participant, {"address": "Via Tortora 2"})
 
     rows = session.query(ContactInfo).filter_by(participant_id=participant.id).all()
     assert len(rows) == 1
-    assert rules.load_contact(session, participant) == {"address": "Via Po 2"}
+    assert rules.load_contact(session, participant) == {"address": "Via Tortora 2"}
 
 
 def test_add_wishlist_item_appends_positions(session, make_circle, make_participant):
@@ -234,15 +234,46 @@ def test_replace_exclusions_with_empty_list_clears(session, make_circle, make_pa
 
 def test_join_circle_after_withdraw_clears_flag(session, make_circle):
     circle = make_circle()
-    owner = rules.get_user(session, "1")
-    circle.owner_id = owner.id
-    session.flush()
 
-    rules.join_circle(session, circle, "1")
-    rules.leave_circle(session, circle, "1")
-    participant = rules.join_circle(session, circle, "1")
+    rules.join_circle(session, circle, "2")
+    rules.leave_circle(session, circle, "2")
+    participant = rules.join_circle(session, circle, "2")
 
     assert participant.withdrawn_at is None
+
+
+def test_create_circle_joins_owner(session):
+    circle = rules.create_circle(session, name="Xmas", owner_id="42", discord_server_id=1)
+
+    participants = rules.active_participants(session, circle.id)
+    assert len(participants) == 1
+    assert participants[0].user_id == rules.get_user(session, "42").id
+
+
+def test_leave_circle_rejects_owner(session):
+    circle = rules.create_circle(session, name="Xmas", owner_id="42", discord_server_id=1)
+
+    with pytest.raises(rules.OwnerCannotLeave):
+        rules.leave_circle(session, circle, "42")
+
+
+def test_leave_circle_allows_other_participant(session):
+    circle = rules.create_circle(session, name="Xmas", owner_id="42", discord_server_id=1)
+    rules.join_circle(session, circle, "43")
+
+    rules.leave_circle(session, circle, "43")
+
+    assert rules.active_count(session, circle.id) == 1
+
+
+def test_active_participants_ignores_withdrawn(session, make_circle, make_participant):
+    circle = make_circle()
+    stays = make_participant(circle)
+    gone = make_participant(circle)
+    gone.withdrawn_at = rules.utc_to_now()
+    session.flush()
+
+    assert [participant.id for participant in rules.active_participants(session, circle.id)] == [stays.id]
 
 
 @pytest.mark.parametrize("status", ["collecting", "drawn"])

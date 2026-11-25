@@ -1,3 +1,4 @@
+import random
 from datetime import datetime, timezone
 
 import sqlalchemy as sa
@@ -5,7 +6,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from crypto import decrypt_payload, encrypt_payload
-from db.models import Circle, ContactInfo, Exclusion, Participant, User, WishlistItem
+from db.models import (
+    Assignment,
+    Circle,
+    ContactInfo,
+    Exclusion,
+    Participant,
+    Shipment,
+    User,
+    WishlistItem,
+)
+from draw import find_pairing
 
 
 class CircleError(Exception):
@@ -30,6 +41,12 @@ class NotOwner(CircleError):
     pass
 
 class OwnerCannotLeave(CircleError):
+    pass
+
+class DrawImpossible(CircleError):
+    pass
+
+class AlreadyClosed(CircleError):
     pass
 
 def utc_to_now() -> datetime:
@@ -94,6 +111,15 @@ def find_circle(session: Session, server_id: int , name: str | None = None, chan
 def active_count(session: Session, circle_id: int) -> int:
     query = sa.select(sa.func.count()).select_from(Participant).where(Participant.circle_id == circle_id, Participant.withdrawn_at.is_(None))
     return session.scalar(query) or 0
+
+
+def active_participants(session: Session, circle_id: int) -> list[Participant]:
+    query = (
+        sa.select(Participant)
+        .where(Participant.circle_id == circle_id, Participant.withdrawn_at.is_(None))
+        .order_by(Participant.id)
+    )
+    return list(session.scalars(query))
 
 def join_circle(session: Session, circle: Circle, discord_id: str) -> Participant:
     if circle.status != "open":
@@ -231,6 +257,15 @@ def exclusion_ids(session: Session, participant: Participant) -> list[int]:
     return list(session.scalars(query))
 
 
+def wishlist_items(session: Session, participant: Participant) -> list[WishlistItem]:
+    query = (
+        sa.select(WishlistItem)
+        .where(WishlistItem.participant_id == participant.id)
+        .order_by(WishlistItem.position, WishlistItem.id)
+    )
+    return list(session.scalars(query))
+
+
 def replace_exclusions(session: Session, circle: Circle, giver: Participant, excluded_ids: list[int]) -> None:
     session.execute(sa.delete(Exclusion).where(Exclusion.giver_participant_id == giver.id))
     allowed = set(
@@ -255,3 +290,236 @@ def replace_exclusions(session: Session, circle: Circle, giver: Participant, exc
             )
         )
     session.flush()
+
+
+def draw_circle(
+    session: Session, circle: Circle, rng: random.Random | None = None
+) -> dict[int, int] | None:
+    """Draw the current round. Returns giver -> receiver, or None if it was already drawn.
+
+    Raises DrawImpossible when the constraints leave no valid pairing; in that
+    case the circle is left untouched so people can relax their exclusions.
+    """
+    participants = active_participants(session, circle.id)
+    exclusions = {
+        participant.id: set(exclusion_ids(session, participant))
+        for participant in participants
+    }
+    pairing = find_pairing(
+        [participant.id for participant in participants],
+        exclusions,
+        rng or random.Random(),
+    )
+    if pairing is None:
+        raise DrawImpossible(circle.name)
+
+    round_no = circle.current_round + 1
+    if not try_mark_drawn(session, circle.id):
+        return None
+
+    for giver_id, receiver_id in pairing.items():
+        session.add(
+            Assignment(
+                circle_id=circle.id,
+                round=round_no,
+                giver_participant_id=giver_id,
+                receiver_participant_id=receiver_id,
+            )
+        )
+    session.flush()
+    return pairing
+
+
+def purge_personal_data(session: Session, circle_id: int) -> None:
+    """Delete everything that identifies a person, keeping only ids and assignments."""
+    participant_ids = sa.select(Participant.id).where(Participant.circle_id == circle_id)
+    assignment_ids = sa.select(Assignment.id).where(Assignment.circle_id == circle_id)
+    session.execute(sa.delete(Shipment).where(Shipment.assignment_id.in_(assignment_ids)))
+    session.execute(sa.delete(ContactInfo).where(ContactInfo.participant_id.in_(participant_ids)))
+    session.execute(sa.delete(WishlistItem).where(WishlistItem.participant_id.in_(participant_ids)))
+    session.execute(sa.delete(Exclusion).where(Exclusion.circle_id == circle_id))
+    session.flush()
+
+
+def close_circle(session: Session, circle: Circle, discord_id: str) -> None:
+    owner = session.scalar(sa.select(User).where(User.discord_id == discord_id))
+    if owner is None or owner.id != circle.owner_id:
+        raise NotOwner(circle.name)
+    if circle.status == "closed":
+        raise AlreadyClosed(circle.name)
+    purge_personal_data(session, circle.id)
+    circle.status = "closed"
+    session.flush()
+
+
+def due_open_circles(session: Session, now: datetime) -> list[int]:
+    query = sa.select(Circle.id).where(
+        Circle.status == "open",
+        Circle.signup_deadline.is_not(None),
+        Circle.signup_deadline <= now,
+    )
+    return list(session.scalars(query))
+
+
+def stale_drawn_circles(session: Session, cutoff: datetime) -> list[int]:
+    query = sa.select(Circle.id).where(
+        Circle.status == "drawn",
+        Circle.exchange_date.is_not(None),
+        Circle.exchange_date <= cutoff,
+    )
+    return list(session.scalars(query))
+
+
+def leave_any_time(session: Session, circle: Circle, discord_id: str) -> tuple[str, int | None]:
+    """Withdraw a participant, re-linking the chain when names are already drawn.
+
+    Returns "left" (nothing else to do), "spliced" or "reset" (the round was
+    cancelled and the circle is collecting again).
+    """
+    if circle.status == "closed":
+        raise GroupNotOpen(circle.name)
+    user = session.scalar(sa.select(User).where(User.discord_id == discord_id))
+    if user is not None and user.id == circle.owner_id:
+        raise OwnerCannotLeave(circle.name)
+    participant = None
+    if user is not None:
+        participant = session.scalar(
+            sa.select(Participant).where(
+                Participant.circle_id == circle.id, Participant.user_id == user.id
+            )
+        )
+    if participant is None or participant.withdrawn_at is not None:
+        raise NotJoined(circle.name)
+
+    participant.withdrawn_at = utc_to_now()
+    session.flush()
+    if circle.status != "drawn":
+        return "left", None
+
+    round_no = circle.current_round
+    outgoing = session.scalar(
+        sa.select(Assignment).where(
+            Assignment.circle_id == circle.id,
+            Assignment.round == round_no,
+            Assignment.giver_participant_id == participant.id,
+        )
+    )
+    incoming = session.scalar(
+        sa.select(Assignment).where(
+            Assignment.circle_id == circle.id,
+            Assignment.round == round_no,
+            Assignment.receiver_participant_id == participant.id,
+        )
+    )
+    if outgoing is None or incoming is None:
+        return "left", None
+
+    donor = incoming.giver_participant_id
+    beneficiary = outgoing.receiver_participant_id
+    session.delete(outgoing)
+    session.delete(incoming)
+    session.flush()
+
+    two_cycle = donor == beneficiary or session.scalar(
+        sa.select(Assignment.id).where(
+            Assignment.circle_id == circle.id,
+            Assignment.round == round_no,
+            Assignment.giver_participant_id == beneficiary,
+            Assignment.receiver_participant_id == donor,
+        )
+    )
+    if two_cycle or active_count(session, circle.id) < 3:
+        session.execute(
+            sa.delete(Assignment).where(
+                Assignment.circle_id == circle.id, Assignment.round == round_no
+            )
+        )
+        circle.current_round = max(circle.current_round - 1, 0)
+        circle.status = "collecting"
+        for remaining in active_participants(session, circle.id):
+            remaining.ready = False
+        session.flush()
+        return "reset", None
+
+    session.add(
+        Assignment(
+            circle_id=circle.id,
+            round=round_no,
+            giver_participant_id=donor,
+            receiver_participant_id=beneficiary,
+        )
+    )
+    session.flush()
+    return "spliced", donor
+
+
+def add_participant_after_draw(
+    session: Session, circle: Circle, discord_id: str
+) -> tuple[int, int]:
+    """Insert a participant into the drawn chain. Returns (participant_id, new_giver_id)."""
+    if circle.status != "drawn":
+        raise GroupNotOpen(circle.name)
+    user = get_user(session, discord_id)
+    participant = session.scalar(
+        sa.select(Participant).where(
+            Participant.circle_id == circle.id, Participant.user_id == user.id
+        )
+    )
+    if participant is not None and participant.withdrawn_at is None:
+        raise AlreadyJoined(circle.name)
+
+    round_no = circle.current_round
+    edge = session.scalar(
+        sa.select(Assignment)
+        .where(Assignment.circle_id == circle.id, Assignment.round == round_no)
+        .order_by(Assignment.id.desc())
+        .limit(1)
+    )
+    if edge is None:
+        raise GroupNotFound(circle.name)
+
+    giver_id = edge.giver_participant_id
+    receiver_id = edge.receiver_participant_id
+    session.delete(edge)
+    session.flush()
+
+    if participant is None:
+        participant = Participant(circle_id=circle.id, user_id=user.id)
+        session.add(participant)
+        session.flush()
+    else:
+        participant.withdrawn_at = None
+        participant.ready = False
+        session.flush()
+
+    session.add(
+        Assignment(
+            circle_id=circle.id,
+            round=round_no,
+            giver_participant_id=giver_id,
+            receiver_participant_id=participant.id,
+        )
+    )
+    session.add(
+        Assignment(
+            circle_id=circle.id,
+            round=round_no,
+            giver_participant_id=participant.id,
+            receiver_participant_id=receiver_id,
+        )
+    )
+    session.flush()
+    return participant.id, giver_id
+
+
+def assignment_for(session: Session, circle_id: int, giver_participant_id: int) -> Assignment | None:
+    circle = session.get(Circle, circle_id)
+    if circle is None:
+        return None
+    return session.scalar(
+        sa.select(Assignment).where(
+            Assignment.circle_id == circle_id,
+            Assignment.round == circle.current_round,
+            Assignment.giver_participant_id == giver_participant_id,
+        )
+    )

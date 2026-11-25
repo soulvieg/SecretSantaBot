@@ -14,6 +14,9 @@ class BotClient(commands.Bot):
     async def setup_hook(self) -> None:
         Base.metadata.create_all(engine)
         await self.load_extension("cogs.santa")
+        await self.load_extension("cogs.profile")
+        await self.load_extension("cogs.gift")
+        await self.load_extension("cogs.scheduler")
 
         # Setup for dev testing server
         if self.settings.dev:

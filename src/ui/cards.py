@@ -7,7 +7,7 @@ from times import discord_ts
 
 STATUS = {
     "open": "Singup open",
-    "info": "Collecting info",
+    "collecting": "Collecting info",
     "drawn": "Names drawn",
     "closed": "Closed",
 }
