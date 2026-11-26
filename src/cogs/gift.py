@@ -43,23 +43,25 @@ def reveal_embed(
     if budget:
         embed.add_field(name="Budget", value=f"{budget / 100:.2f} {currency}", inline=True)
 
-    if contact is None:
-        embed.add_field(
-            name="Ship to",
-            value="⚠️ No address on file. Ask the organizer.",
-            inline=False,
-        )
-    else:
-        home = ", ".join(
-            part for part in (contact.get("address"), contact.get("city_zip")) if part
-        )
-        embed.add_field(name="Ship to", value=home or "⚠️ Missing", inline=False)
-        if contact.get("phone"):
-            embed.add_field(name="Phone", value=str(contact["phone"]), inline=True)
-        if contact.get("digital"):
-            embed.add_field(name="Digital contact", value=str(contact["digital"]), inline=True)
-        if contact.get("notes"):
-            embed.add_field(name="Notes", value=str(contact["notes"]), inline=False)
+    contact = contact or {}
+    street = " ".join(
+        part for part in (contact.get("street"), contact.get("street_number")) if part
+    )
+    locality = " ".join(part for part in (contact.get("zip"), contact.get("city")) if part)
+    home = ", ".join(part for part in (street, locality) if part)
+    embed.add_field(
+        name="Ship to",
+        value=home or "⚠️ No address on file. Ask the organizer.",
+        inline=False,
+    )
+    if contact.get("steam"):
+        embed.add_field(name="Steam wishlist", value=str(contact["steam"]), inline=False)
+    if contact.get("phone"):
+        embed.add_field(name="Phone", value=str(contact["phone"]), inline=True)
+    if contact.get("digital"):
+        embed.add_field(name="Digital contact", value=str(contact["digital"]), inline=True)
+    if contact.get("notes"):
+        embed.add_field(name="Notes", value=str(contact["notes"]), inline=False)
 
     if items:
         lines: list[str] = []
@@ -80,10 +82,11 @@ def reveal_embed(
 
 
 def reveal_view(assignment_id: int) -> discord.ui.View:
-    """The two buttons that live in the reveal DM: relay and shipment."""
+    """The buttons that live in the reveal DM: relay, shipment and refresh."""
     view = discord.ui.View(timeout=None)
     view.add_item(RelayButton(assignment_id, "giftee"))
     view.add_item(ShippedButton(assignment_id))
+    view.add_item(RefreshButton(assignment_id))
     return view
 
 
@@ -249,6 +252,58 @@ class ShippedButton(
         await interaction.response.send_modal(ShipmentModal(self.assignment_id))
 
 
+class RefreshButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"santa:reveal:(?P<assignment>\d+)",
+):
+    """Rewrite the reveal DM with the giftee's latest address, contacts and wishlist."""
+
+    def __init__(self, assignment_id: int) -> None:
+        super().__init__(
+            discord.ui.Button(
+                label="Refresh giftee info",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"santa:reveal:{assignment_id}",
+                row=1,
+            )
+        )
+        self.assignment_id = assignment_id
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Item,
+        match: re.Match[str],
+        /,
+    ) -> Self:
+        return cls(int(match["assignment"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        with get_session() as session:
+            assignment = session.get(Assignment, self.assignment_id)
+            payload = None
+            if assignment is not None:
+                circle = session.get(Circle, assignment.circle_id)
+                if circle is not None and circle.status == "drawn":
+                    payload = _reveal_payload(session, assignment)
+
+        if payload is None:
+            await interaction.response.send_message(
+                "This exchange is over or changed. Ask the organizer.", ephemeral=True
+            )
+            return
+
+        giver_discord_id, embed = payload
+        if str(interaction.user.id) != giver_discord_id:
+            await interaction.response.send_message(
+                "This reveal isn't yours.", ephemeral=True
+            )
+            return
+
+        await interaction.response.edit_message(embed=embed)
+
+
 class RelayModal(discord.ui.Modal, title="Write a message"):
     message = discord.ui.TextInput(
         label="Message",
@@ -399,7 +454,7 @@ class Gift(commands.Cog):
 
     async def cog_load(self) -> None:
         # Buttons in old DMs keep working after a restart.
-        self.bot.add_dynamic_items(RelayButton, ShippedButton)
+        self.bot.add_dynamic_items(RelayButton, ShippedButton, RefreshButton)
 
 
 async def setup(bot: commands.Bot) -> None:

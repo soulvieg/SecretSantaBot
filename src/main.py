@@ -3,6 +3,7 @@ from logging.handlers import RotatingFileHandler
 from bot import BotClient
 
 import config
+import crypto
 
 
 def set_logging(level: str = "INFO") -> None:
@@ -22,6 +23,7 @@ def main() -> None:
     settings = config.get_settings()
     #Setup the logger for debugging
     set_logging(settings.log_lvl)
+    crypto.validate_key()
     logger = logging.getLogger(__name__)
 #   logger.info("event %s created by %s", event.id, user.id)
 

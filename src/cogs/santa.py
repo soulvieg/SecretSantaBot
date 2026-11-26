@@ -25,6 +25,7 @@ from db.rules import (
     close_circle,
     close_signup,
     create_circle,
+    delete_circle,
     find_circle,
     join_circle,
     leave_circle,
@@ -45,9 +46,34 @@ class CreateCircleModal(discord.ui.Modal, title="New secret santa event"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         channel = interaction.channel
-        if interaction.guild_id is None or not isinstance(channel, discord.abc.Messageable):
+        if (
+            interaction.guild_id is None
+            or interaction.guild is None
+            or not isinstance(channel, discord.abc.GuildChannel)
+            or not isinstance(channel, discord.abc.Messageable)
+        ):
             await interaction.response.send_message("Run this inside a text channel", ephemeral=True)
             return
+
+        required = [
+            ("view_channel", "View Channel"),
+            ("send_messages", "Send Messages"),
+            ("embed_links", "Embed Links"),
+        ]
+        if isinstance(channel, discord.Thread):
+            required.append(("send_messages_in_threads", "Send Messages in Threads"))
+        member = interaction.guild.me
+        if member is not None:
+            permissions = channel.permissions_for(member)
+            missing = [label for attr, label in required if not getattr(permissions, attr)]
+            if missing:
+                await interaction.response.send_message(
+                    "I can't post the signup card in this channel. Missing: "
+                    + ", ".join(missing),
+                    ephemeral=True,
+                )
+                return
+
         budget = None
         if self.budget.value.strip():
             try:
@@ -78,7 +104,26 @@ class CreateCircleModal(discord.ui.Modal, title="New secret santa event"):
             await interaction.response.send_message(f"You already have an event called **{name}** on this server", ephemeral=True)
             return
 
-        message = await channel.send(embed=embed, view=JoinLeaveView())
+        try:
+            message = await channel.send(embed=embed, view=JoinLeaveView())
+        except discord.Forbidden:
+            with get_session() as session:
+                delete_circle(session, circle_id)
+            await interaction.response.send_message(
+                "Discord denied the signup card: check my permissions in this channel "
+                "(View Channel, Send Messages, Embed Links).",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            with get_session() as session:
+                delete_circle(session, circle_id)
+            await interaction.response.send_message(
+                "Discord rejected the signup card. Try again in a moment.",
+                ephemeral=True,
+            )
+            return
+
         with get_session() as session:
             set_card(session, circle_id, channel.id, message.id)
 
@@ -129,7 +174,10 @@ class JoinLeaveView(discord.ui.View):
         await interaction.response.send_message(
             "You left the event." if leaving else "You are in! 🎅", ephemeral=True
         )
-        await interaction.message.edit(embed=embed)
+        try:
+            await interaction.message.edit(embed=embed)
+        except discord.HTTPException:
+            pass
 
 
 class ConfirmCloseView(discord.ui.View):

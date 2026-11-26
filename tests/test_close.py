@@ -12,7 +12,7 @@ def test_close_deletes_personal_data_and_keeps_assignments(session, make_user, m
     circle = make_circle(owner=owner)
     giver = make_participant(circle, ready=True)
     receiver = make_participant(circle, ready=True)
-    rules.save_contact(session, giver, {"address": "Via Roma 1", "city_zip": "10100 Torino"})
+    rules.save_contact(session, giver, {"street": "Via Roma", "zip": "10100", "city": "Torino"})
     rules.add_wishlist_item(session, giver, title="Sciarpa", price=1500)
     rules.replace_exclusions(session, circle, giver, [receiver.id])
     assignment = Assignment(
@@ -42,8 +42,8 @@ def test_close_leaves_other_circles_alone(session, make_user, make_circle, make_
     other = make_circle(owner=owner, name="Other")
     mine = make_participant(closing)
     theirs = make_participant(other)
-    rules.save_contact(session, mine, {"address": "A", "city_zip": "B"})
-    rules.save_contact(session, theirs, {"address": "C", "city_zip": "D"})
+    rules.save_contact(session, mine, {"street": "A", "city": "B"})
+    rules.save_contact(session, theirs, {"street": "C", "city": "D"})
 
     rules.close_circle(session, closing, "100")
 
@@ -103,3 +103,44 @@ def test_stale_drawn_circles_respects_the_grace_period(session, make_circle):
     session.flush()
 
     assert rules.stale_drawn_circles(session, now - timedelta(days=14)) == [old.id]
+
+
+def test_delete_circle_removes_everything_it_owns(
+    session, make_user, make_circle, make_participant
+):
+    owner = make_user("100")
+    circle = make_circle(owner=owner, name="Broken")
+    other = make_circle(owner=owner, name="Other")
+    first = make_participant(circle)
+    second = make_participant(circle)
+    kept = make_participant(other)
+    rules.save_contact(session, first, {"street": "A", "city": "B"})
+    rules.add_wishlist_item(session, first, title="Sciarpa")
+    rules.replace_exclusions(session, circle, first, [second.id])
+    assignment = Assignment(
+        circle_id=circle.id,
+        round=1,
+        giver_participant_id=first.id,
+        receiver_participant_id=second.id,
+    )
+    session.add(assignment)
+    session.flush()
+    session.add(Shipment(assignment_id=assignment.id, carrier="Poste"))
+    session.flush()
+
+    rules.delete_circle(session, circle.id)
+
+    assert session.get(rules.Circle, circle.id) is None
+    assert session.scalar(sa.select(sa.func.count()).select_from(ContactInfo)) == 0
+    assert session.scalar(sa.select(sa.func.count()).select_from(WishlistItem)) == 0
+    assert session.scalar(sa.select(sa.func.count()).select_from(Exclusion)) == 0
+    assert session.scalar(sa.select(sa.func.count()).select_from(Shipment)) == 0
+    assert session.scalar(sa.select(sa.func.count()).select_from(Assignment)) == 0
+    remaining = list(session.scalars(sa.select(rules.Participant)))
+    assert [participant.id for participant in remaining] == [kept.id]
+
+
+def test_delete_circle_is_a_no_op_for_unknown_ids(session):
+    rules.delete_circle(session, 999)
+
+    assert session.scalar(sa.select(sa.func.count()).select_from(rules.Circle)) == 0

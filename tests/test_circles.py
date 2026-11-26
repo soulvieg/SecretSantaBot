@@ -101,7 +101,8 @@ def test_participant_from_panel_unknown_id(session):
 def test_contact_roundtrip(session, make_circle, make_participant):
     participant = make_participant(make_circle())
     payload = {
-        "address": "Via Roma 1",
+        "street": "Via Roma",
+        "street_number": "1",
         "city": "Milan",
         "zip": "10221",
         "phone": "+39 000 000 0000",
@@ -120,12 +121,12 @@ def test_contact_roundtrip(session, make_circle, make_participant):
 def test_save_contact_upserts_single_row(session, make_circle, make_participant):
     participant = make_participant(make_circle())
 
-    rules.save_contact(session, participant, {"address": "Via Roma 1"})
-    rules.save_contact(session, participant, {"address": "Via Tortora 2"})
+    rules.save_contact(session, participant, {"street": "Via Roma"})
+    rules.save_contact(session, participant, {"street": "Via Tortora"})
 
     rows = session.query(ContactInfo).filter_by(participant_id=participant.id).all()
     assert len(rows) == 1
-    assert rules.load_contact(session, participant) == {"address": "Via Tortora 2"}
+    assert rules.load_contact(session, participant) == {"street": "Via Tortora"}
 
 
 def test_add_wishlist_item_appends_positions(session, make_circle, make_participant):

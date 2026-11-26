@@ -20,9 +20,9 @@ from db.rules import (
     owner_discord_id,
     participant_from_panel,
     replace_exclusions,
-    save_contact,
     set_panel_message,
     set_ready,
+    update_contact,
     wishlist_count,
 )
 
@@ -41,10 +41,18 @@ def participant_id_from(interaction: discord.Interaction) -> int | None:
         return found.id if found is not None else None
 
 
+def has_any_contact(contact: dict | None) -> bool:
+    if contact is None:
+        return False
+    return any(value for value in contact.values() if isinstance(value, str) and value.strip())
+
+
 def render_panel(
     session: Session, participant: Participant, circle: Circle
 ) -> tuple[discord.Embed, "PanelView"]:
-    has_contact = load_contact(session, participant) is not None
+    contact = load_contact(session, participant)
+    has_contact = has_any_contact(contact)
+    has_address = bool(contact and (contact.get("street") or contact.get("city")))
     items = wishlist_count(session, participant.id)
     excludes = exclusion_ids(session, participant)
     uses_exclusions = (
@@ -54,19 +62,21 @@ def render_panel(
 
     embed = discord.Embed(title=f"🎅 {circle.name}", color=discord.Color.red())
     embed.description = (
-        "Fill in your details, then press **Done**. "
-        "Your address is only shown to whoever draws your name."
+        "Fill in what you want to share (all fields are optional), then press "
+        "**Done**. Your address is only shown to whoever draws your name."
     )
     if circle.status == "drawn":
         embed.description = (
             "Names are drawn: check your DMs for your giftee. "
             "You can still update your info if something changes."
         )
-    embed.add_field(
-        name="Contact info",
-        value="✅ saved" if has_contact else "❌ missing",
-        inline=True,
-    )
+    if has_address:
+        address_state = "✅ saved"
+    elif has_contact:
+        address_state = "⚠️ no address"
+    else:
+        address_state = "not set (optional)"
+    embed.add_field(name="Address", value=address_state, inline=True)
     embed.add_field(
         name="Wishlist",
         value=f"{items}/{MAX_WISHLIST_ITEMS} items" if items else "❌ none yet",
@@ -141,7 +151,7 @@ class PanelView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="Contact info",
+        label="Address",
         style=discord.ButtonStyle.primary,
         custom_id="santa:panel:contact",
     )
@@ -153,6 +163,21 @@ class PanelView(discord.ui.View):
             )
             return
         await interaction.response.send_modal(ContactModal(participant_id))
+
+    @discord.ui.button(
+        label="Phone & digital",
+        style=discord.ButtonStyle.secondary,
+        custom_id="santa:panel:extras",
+        row=1,
+    )
+    async def extras(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        participant_id = participant_id_from(interaction)
+        if participant_id is None:
+            await interaction.response.send_message(
+                "This panel is no longer valid.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(ContactExtraModal(participant_id))
 
     @discord.ui.button(
         label="Wishlist",
@@ -279,8 +304,6 @@ class PanelView(discord.ui.View):
                 circle = session.get(Circle, participant.circle_id)
                 if circle is None:
                     state = "gone"
-                elif load_contact(session, participant) is None:
-                    state = "no_contact"
                 elif circle.status == "closed":
                     state = "closed"
                 else:
@@ -303,12 +326,6 @@ class PanelView(discord.ui.View):
         if state == "closed":
             await interaction.response.send_message(
                 "This event is closed.", ephemeral=True
-            )
-            return
-        if state == "no_contact":
-            await interaction.response.send_message(
-                "Add your contact info first: the organizer needs an address to ship to.",
-                ephemeral=True,
             )
             return
 
@@ -480,15 +497,81 @@ class ExclusionView(discord.ui.View):
         self.add_item(ExclusionSelect(participant_id, options))
 
 
-class ContactModal(discord.ui.Modal, title="Your contact info"):
-    street = discord.ui.TextInput(label="Street and number", max_length=256)
-    city_zip = discord.ui.TextInput(label="City and ZIP", max_length=128)
-    phone = discord.ui.TextInput(label="Phone (optional)", required=False, max_length=32)
+async def save_contact_fields(
+    interaction: discord.Interaction, participant_id: int, updates: dict
+) -> None:
+    """Store a partial contact, then refresh the panel and the giftee's reveal."""
+    saved = False
+    with get_session() as session:
+        participant = session.get(Participant, participant_id)
+        if participant is not None:
+            update_contact(session, participant, updates)
+            saved = True
+
+    if not saved:
+        await interaction.response.send_message(
+            "This panel is no longer valid.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message("Saved.", ephemeral=True)
+    await refresh_panel(interaction, participant_id)
+    with get_session() as session:
+        participant = session.get(Participant, participant_id)
+        circle_id = participant.circle_id if participant is not None else None
+    if circle_id is not None:
+        # Whoever is giving to this participant needs the new address.
+        await refresh_reveal_for(interaction.client, circle_id, participant_id)
+
+
+class ContactModal(discord.ui.Modal, title="Your shipping address"):
+    """Every field is optional: the event can start without a full address."""
+
+    street = discord.ui.TextInput(
+        label="Street (optional)", required=False, max_length=256
+    )
+    street_number = discord.ui.TextInput(
+        label="Number (optional)", required=False, max_length=16
+    )
+    city = discord.ui.TextInput(
+        label="City (optional)", required=False, max_length=128
+    )
+    zip = discord.ui.TextInput(
+        label="ZIP (optional)", required=False, max_length=16
+    )
+
+    def __init__(self, participant_id: int) -> None:
+        super().__init__()
+        self.participant_id = participant_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await save_contact_fields(
+            interaction,
+            self.participant_id,
+            {
+                "street": self.street.value.strip(),
+                "street_number": self.street_number.value.strip(),
+                "city": self.city.value.strip(),
+                "zip": self.zip.value.strip(),
+            },
+        )
+
+
+class ContactExtraModal(discord.ui.Modal, title="Phone, digital and Steam"):
+    phone = discord.ui.TextInput(
+        label="Phone (optional)", required=False, max_length=32
+    )
     digital = discord.ui.TextInput(
         label="Digital contact (optional)",
         required=False,
         max_length=256,
         placeholder="steam / telegram / email",
+    )
+    steam = discord.ui.TextInput(
+        label="Steam wishlist link (optional)",
+        required=False,
+        max_length=2048,
+        placeholder="https://store.steampowered.com/wishlist/...",
     )
     notes = discord.ui.TextInput(
         label="Notes (optional)",
@@ -502,43 +585,22 @@ class ContactModal(discord.ui.Modal, title="Your contact info"):
         self.participant_id = participant_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        street = self.street.value.strip()
-        city_zip = self.city_zip.value.strip()
-        if not street or not city_zip:
+        steam = self.steam.value.strip()
+        if steam and not steam.startswith(("http://", "https://")):
             await interaction.response.send_message(
-                "Street and city can't be empty.", ephemeral=True
+                "The Steam link must start with https://.", ephemeral=True
             )
             return
-
-        payload = {
-            "address": street,
-            "city_zip": city_zip,
-            "phone": (self.phone.value or "").strip() or None,
-            "digital": (self.digital.value or "").strip() or None,
-            "notes": (self.notes.value or "").strip() or None,
-        }
-
-        saved = False
-        with get_session() as session:
-            participant = session.get(Participant, self.participant_id)
-            if participant is not None:
-                save_contact(session, participant, payload)
-                saved = True
-
-        if not saved:
-            await interaction.response.send_message(
-                "This panel is no longer valid.", ephemeral=True
-            )
-            return
-
-        await interaction.response.send_message("Saved.", ephemeral=True)
-        await refresh_panel(interaction, self.participant_id)
-        with get_session() as session:
-            participant = session.get(Participant, self.participant_id)
-            circle_id = participant.circle_id if participant is not None else None
-        if circle_id is not None:
-            # Whoever is giving to this participant needs the new address.
-            await refresh_reveal_for(interaction.client, circle_id, self.participant_id)
+        await save_contact_fields(
+            interaction,
+            self.participant_id,
+            {
+                "phone": self.phone.value.strip(),
+                "digital": self.digital.value.strip(),
+                "steam": steam,
+                "notes": self.notes.value.strip(),
+            },
+        )
 
 
 class WishlistModal(discord.ui.Modal, title="Wishlist: add one item"):

@@ -222,6 +222,14 @@ def save_contact(session: Session, participant: Participant, payload: dict) -> N
     session.flush()
 
 
+def update_contact(session: Session, participant: Participant, updates: dict) -> None:
+    """Merge partial fields into the stored contact, dropping the ones left empty."""
+    payload = load_contact(session, participant) or {}
+    payload.update(updates)
+    payload = {key: value for key, value in payload.items() if value}
+    save_contact(session, participant, payload)
+
+
 def load_contact(session: Session, participant: Participant) -> dict | None:
     row = session.scalar(sa.select(ContactInfo).where(ContactInfo.participant_id == participant.id))
     if row is None:
@@ -523,3 +531,15 @@ def assignment_for(session: Session, circle_id: int, giver_participant_id: int) 
             Assignment.giver_participant_id == giver_participant_id,
         )
     )
+
+
+def delete_circle(session: Session, circle_id: int) -> None:
+    """Remove a circle and everything that belongs to it. Used to undo a failed creation."""
+    circle = session.get(Circle, circle_id)
+    if circle is None:
+        return
+    purge_personal_data(session, circle_id)
+    session.execute(sa.delete(Assignment).where(Assignment.circle_id == circle_id))
+    session.execute(sa.delete(Participant).where(Participant.circle_id == circle_id))
+    session.delete(circle)
+    session.flush()
